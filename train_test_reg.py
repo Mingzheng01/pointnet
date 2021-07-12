@@ -1,10 +1,6 @@
-import argparse
-import math
 import h5py
 import numpy as np
 import tensorflow as tf
-import socket
-import importlib
 import os
 import sys
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +11,9 @@ import provider
 import tf_util
 import pointnet_reg as MODEL
 import vg
+import open3d as o3d
+import scipy
+from scipy.spatial.transform import Rotation
 
 DECAY_STEP = 2
 DECAY_RATE = 0.7
@@ -26,10 +25,7 @@ BN_DECAY_CLIP = 0.99
 MOMENTUM = 0.9
 BATCH_SIZE = 32
 LOG_DIR = 'log'
-MAX_EPOCH = 50
-
-
-
+MAX_EPOCH = 80
 
 def log_string(out_str):
    # LOG_FOUT.write(out_str+'\n')
@@ -73,7 +69,7 @@ def train(point_cloud_data):
 
             #get model and loss
             pred = MODEL.get_model(point_clouds_ph, is_training_ph, bn_decay)
-            loss = MODEL.get_loss(pred, rot_ph)
+            loss, mat_diff_sum = MODEL.get_loss(pred, rot_ph)
             tf.summary.scalar("loss", loss)
             print(pred)
             print(loss)
@@ -88,7 +84,7 @@ def train(point_cloud_data):
             optimizer = tf.train.MomentumOptimizer(learning_rate, momentum=MOMENTUM)
             train_op = optimizer.minimize(loss, global_step=batch)
 
-            saver = tf.train.Saver()
+        saver = tf.train.Saver()
 
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
@@ -99,7 +95,6 @@ def train(point_cloud_data):
         # add summary writers..
         merged = tf.summary.merge_all()
         train_writer = tf.summary.FileWriter(os.path.join(LOG_DIR, "train_test"), sess.graph)
-        test_writer = tf.summary.FileWriter(os.path.join(LOG_DIR, "test_test"))
 
         # init variables
         init = tf.global_variables_initializer()
@@ -110,6 +105,7 @@ def train(point_cloud_data):
                'is_training_pl': is_training_ph,
                'pred': pred,
                'loss': loss,
+               "mat_diff_sum":mat_diff_sum,
                'train_op': train_op,
                'merged': merged,
                'step': batch,
@@ -120,6 +116,10 @@ def train(point_cloud_data):
             sys.stdout.flush()
 
             train_one_epoch(sess, ops, train_writer)
+
+
+            save_path = saver.save(sess, os.path.join(LOG_DIR, "reg_model"), global_step=epoch )
+            log_string("Model saved in file: %s" % save_path)
 
 def train_one_epoch(sess, ops, train_writer):
 
@@ -137,9 +137,11 @@ def train_one_epoch(sess, ops, train_writer):
 
     rand_rot_mat = []
     for _ in range(point_clouds.shape[0]):
-        mat = np.random.rand(3, 3)
-        q, _ = np.linalg.qr(mat)
-        rand_rot_mat.append(q)
+        # mat = np.random.rand(3, 3)
+        #q, _ = np.linalg.qr(mat)
+        #rand_rot_mat.append(q)
+        mat = scipy.spatial.transform.Rotation.random().as_matrix()
+        rand_rot_mat.append(np.array(mat))
     rand_rot_mat = np.array(rand_rot_mat)
 
     for batch_idx in range(num_batches):
@@ -148,23 +150,34 @@ def train_one_epoch(sess, ops, train_writer):
         selected_point_clouds = point_clouds[batch_indices]
         selected_rot_mat = rand_rot_mat[batch_indices]
 
-        rotated_data = selected_point_clouds
+        rotated_point_clouds = selected_point_clouds
         for i in range(BATCH_SIZE):
             for j in range(selected_point_clouds.shape[1]):
-                rotated_data[i, j, :] = np.matmul(selected_rot_mat[i], selected_point_clouds[i, j, :])
+                rotated_point_clouds[i, j, :] = np.matmul(selected_rot_mat[i], selected_point_clouds[i, j, :])
 
-        jittered_data = provider.jitter_point_cloud(rotated_data)
-        feed_dict = {ops['pointclouds_pl']: jittered_data,
+        #jittered_data = provider.jitter_point_cloud(rotated_data)
+
+        #pcd = o3d.geometry.PointCloud()
+        #pcd.points = o3d.utility.Vector3dVector(point_clouds[0])
+        #axes= o3d.geometry.TriangleMesh.create_coordinate_frame(size=3.)
+       # axes.rotate(np.array(selected_rot_mat[0]))
+        #o3d.visualization.draw_geometries([pcd, axes])
+
+        feed_dict = {ops['pointclouds_pl']: rotated_point_clouds,
                      ops['rot_ph']: selected_rot_mat,
                      ops['is_training_pl']: is_training, }
-        summary, step, _, loss_val, pred_val = sess.run([ops['merged'], ops['step'],
-                                                         ops['train_op'], ops['loss'], ops['pred']],
+
+        writer = tf.summary.FileWriter('logs', sess.graph)
+        summary, step, _, loss_val, pred_val, mat_diff_sum = sess.run([ops['merged'], ops['step'],
+                                                         ops['train_op'], ops['loss'], ops['pred'],ops['mat_diff_sum']],
                                                         feed_dict=feed_dict)
+       # writer.add_summary(summary=mat_reduce_sum, global_step=0)
+        writer.close()
 
         rot_vector_pred = np.array([np.matmul(pred_val[i, :, :], [1., 1., 1.]) for i in range(BATCH_SIZE)])
         rot_vector = np.array([np.matmul(selected_rot_mat[i, :, :], [1., 1., 1.]) for i in range(BATCH_SIZE)])
-        for i in range(BATCH_SIZE):
-            print(vg.angle(rot_vector[i], rot_vector_pred[i]))
+        #for i in range(BATCH_SIZE):
+            #print(vg.angle(rot_vector[i], rot_vector_pred[i]))
 
         train_writer.add_summary(summary, step)
         #pred_val = np.argmax(pred_val, 1)
@@ -175,30 +188,30 @@ def train_one_epoch(sess, ops, train_writer):
         loss_sum += loss_val
 
         print("batch loss: %f" % loss_val)
+        print("mat diff sum: %f" % mat_diff_sum)
+
+        prediction = tf.compat.v1.get_default_graph().get_tensor_by_name("transform_net1/prediction:0")
+        input = tf.compat.v1.get_default_graph().get_tensor_by_name("pointcloud_input:0")
+        m_is_training = tf.compat.v1.get_default_graph().get_tensor_by_name("Placeholder:0")
+
+        m_ret = sess.run(prediction, feed_dict={input:rotated_point_clouds, m_is_training:False})
+        print(m_ret[0])
+        print(selected_rot_mat[0])
 
     log_string('mean loss: %f' % (loss_sum / float(num_batches)))
     log_string('accuracy: %f' % (total_correct / float(total_seen)))
 
 if __name__ == "__main__":
 
-    file = h5py.File("./data/tooth_11_point_clouds.h5", 'r')
+    file = h5py.File("F:\\cases\\tooth_11_stls\\point_clouds.hdf5", 'r')
     print(file.keys())
 
-    point_cloud_dst = file['pointclouds']
-    print(point_cloud_dst)
-
-
-    point_clouds = []
-    for i in range(point_cloud_dst.shape[0]):
-        point_clouds.append(np.array(point_cloud_dst[i, 0 : 1024, :]))
+    point_clouds = file['point_clouds']
+    print(point_clouds)
 
     point_clouds = np.array(point_clouds)
 
-    point_clouds_sel = []
-    for i in range(point_clouds.shape[0]):
-        if (np.max(point_clouds[i, :, :]) > .0):
-            point_clouds_sel.append(point_clouds[i, :, :])
 
     print(point_clouds.shape)
 
-    train(np.array(point_clouds_sel))
+    train(point_clouds)

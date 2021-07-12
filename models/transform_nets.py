@@ -48,7 +48,7 @@ def input_transform_net(point_cloud, is_training, bn_decay=None, K=3):
         transform = tf.matmul(net, weights)
         transform = tf.nn.bias_add(transform, biases)
 
-    transform = tf.reshape(transform, [batch_size, 3, K])
+    transform = tf.reshape(transform, [batch_size, 3, K], name='prediction')
     return transform
 
 
